@@ -1,8 +1,10 @@
 import os
 import sys
+import re
 import logging
 from dotenv import load_dotenv
 import psycopg2
+import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -20,6 +22,7 @@ load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
 DATABASE_URL = os.getenv('DATABASE_URL')
+VK_ACCESS_TOKEN = os.getenv('VK_ACCESS_TOKEN')  # Токен для VK API
 
 # Проверка переменных
 if not BOT_TOKEN:
@@ -57,7 +60,9 @@ def init_db():
                     id SERIAL PRIMARY KEY,
                     anime_id INTEGER REFERENCES anime(id) ON DELETE CASCADE,
                     number INTEGER NOT NULL,
-                    video_url TEXT NOT NULL
+                    video_url TEXT NOT NULL,
+                    vk_video_id TEXT,
+                    vk_owner_id TEXT
                 )
             ''')
             cursor.execute('''
@@ -96,15 +101,15 @@ def get_anime_details(anime_id):
 def get_episodes(anime_id):
     with get_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT number, video_url FROM episodes WHERE anime_id = %s ORDER BY number", (anime_id,))
+            cursor.execute("SELECT number, video_url, vk_video_id, vk_owner_id FROM episodes WHERE anime_id = %s ORDER BY number", (anime_id,))
             return cursor.fetchall()
 
-def add_episode(anime_id, number, video_url):
+def add_episode(anime_id, number, video_url, vk_video_id=None, vk_owner_id=None):
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO episodes (anime_id, number, video_url) VALUES (%s, %s, %s)",
-                (anime_id, number, video_url)
+                "INSERT INTO episodes (anime_id, number, video_url, vk_video_id, vk_owner_id) VALUES (%s, %s, %s, %s, %s)",
+                (anime_id, number, video_url, vk_video_id, vk_owner_id)
             )
         conn.commit()
     logger.info(f"Added episode {number} for anime ID {anime_id}")
@@ -126,6 +131,49 @@ def is_admin(user_id):
             cursor.execute("SELECT is_admin FROM users WHERE user_id = %s", (user_id,))
             result = cursor.fetchone()
             return result and result[0]
+
+# ===================== Функции для работы с VK =====================
+def parse_vk_url(url):
+    """Извлекает owner_id и video_id из URL ВКонтакте"""
+    pattern = r'vk\.com\/video(-?\d+_\d+)'
+    match = re.search(pattern, url)
+    if match:
+        return match.group(1)
+    return None
+
+def get_vk_video_url(video_id):
+    """Получает прямую ссылку на видео через VK API"""
+    if not VK_ACCESS_TOKEN:
+        logger.warning("VK_ACCESS_TOKEN not set! Cannot get direct video link.")
+        return None
+    
+    try:
+        response = requests.get(
+            "https://api.vk.com/method/video.get",
+            params={
+                "access_token": VK_ACCESS_TOKEN,
+                "videos": video_id,
+                "v": "5.131"
+            }
+        ).json()
+        
+        if 'response' in response and 'items' in response['response']:
+            video = response['response']['items'][0]
+            # Ищем ссылку на видео с максимальным качеством
+            if 'files' in video:
+                # Приоритет: 1080p -> 720p -> 480p -> 360p
+                for quality in ['mp4_1080', 'mp4_720', 'mp4_480', 'mp4_360']:
+                    if quality in video['files']:
+                        return video['files'][quality]
+            
+            # Если нет прямых ссылок, возвращаем ссылку на плеер
+            return f"https://vk.com/video{video_id}"
+        
+        logger.error(f"VK API error: {response.get('error', 'Unknown error')}")
+        return None
+    except Exception as e:
+        logger.error(f"Error getting VK video: {str(e)}")
+        return None
 
 # ===================== Обработчики команд =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -170,7 +218,7 @@ async def anime_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if episodes:
         episodes_buttons = [
             [InlineKeyboardButton(f"Серия {number}", callback_data=f"episode_{anime_id}_{number}")]
-            for number, _ in episodes
+            for number, _, _, _ in episodes
         ]
         keyboard = episodes_buttons
     else:
@@ -180,11 +228,14 @@ async def anime_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
+    # Редактируем текущее сообщение вместо отправки нового
     await query.edit_message_text(
         f"<b>{title}</b>\n\n{description}",
         parse_mode="HTML",
         reply_markup=reply_markup
     )
+    
+    # Отправляем обложку отдельно, если она есть
     if cover_url:
         await context.bot.send_photo(
             chat_id=query.message.chat_id,
@@ -202,11 +253,28 @@ async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     episode_number = int(data[2])
     
     episodes = get_episodes(anime_id)
-    video_url = next((url for num, url in episodes if num == episode_number), None)
+    video_url = None
+    vk_video_id = None
+    vk_owner_id = None
+    
+    # Ищем нужную серию
+    for num, url, vid, oid in episodes:
+        if num == episode_number:
+            video_url = url
+            vk_video_id = vid
+            vk_owner_id = oid
+            break
     
     if not video_url:
         await query.edit_message_text("Серия не найдена")
         return
+    
+    # Если это VK видео, попробуем получить прямую ссылку
+    if vk_video_id and vk_owner_id:
+        full_vk_id = f"{vk_owner_id}_{vk_video_id}"
+        direct_url = get_vk_video_url(full_vk_id)
+        if direct_url:
+            video_url = direct_url
     
     # Проверяем тип ссылки
     if video_url.startswith("http"):
@@ -225,7 +293,27 @@ async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await menu(query.message)
+    
+    # Получаем список аниме
+    anime_list = get_anime_list()
+    
+    if not anime_list:
+        await query.edit_message_text("Аниме пока нет в базе данных.")
+        return
+    
+    # Создаем клавиатуру с аниме
+    keyboard = [
+        [InlineKeyboardButton(title, callback_data=f"anime_{id}")]
+        for id, title in anime_list
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Редактируем текущее сообщение
+    await query.edit_message_text(
+        "Выберите аниме:",
+        reply_markup=reply_markup
+    )
 
 # ===================== Админ-панель =====================
 async def admin_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -266,7 +354,15 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Админ-панель:", reply_markup=reply_markup)
+    
+    # Если команда вызвана из callback, редактируем сообщение
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            "Админ-панель:",
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text("Админ-панель:", reply_markup=reply_markup)
 
 async def add_anime_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -337,14 +433,14 @@ async def select_anime_for_episode(update: Update, context: ContextTypes.DEFAULT
     context.user_data['selected_anime_id'] = anime_id
     
     await query.edit_message_text(
-        "Отправьте номер серии и ссылку на видео в формате:\n"
-        "<b>Номер серии | Ссылка на видео</b>\n\n"
-        "Пример:\n"
-        "1 | https://example.com/episode1.mp4\n\n"
-        "Или отправьте видеофайл с подписью в формате:\n"
-        "<b>Номер серии</b>\n"
-        "Пример:\n"
-        "1",
+        "Отправьте номер серии и один из вариантов:\n"
+        "1. Ссылку на видео ВКонтакте (например: https://vk.com/video-12345678_456239017)\n"
+        "2. Прямую ссылку на видеофайл\n"
+        "3. Видеофайл с подписью в формате: <b>Номер серии</b>\n\n"
+        "Пример для VK:\n"
+        "1 | https://vk.com/video-12345678_456239017\n\n"
+        "Пример для прямой ссылки:\n"
+        "1 | https://example.com/episode1.mp4",
         parse_mode="HTML"
     )
 
@@ -354,6 +450,8 @@ async def receive_episode_data(update: Update, context: ContextTypes.DEFAULT_TYP
     
     try:
         anime_id = context.user_data['selected_anime_id']
+        vk_video_id = None
+        vk_owner_id = None
         
         if update.message.video:
             # Если прислали видеофайл
@@ -363,19 +461,38 @@ async def receive_episode_data(update: Update, context: ContextTypes.DEFAULT_TYP
                 
             episode_number = int(update.message.caption)
             video_file = await update.message.video.get_file()
-            video_url = video_file.file_path  # Получаем прямую ссылку на видео в Telegram
+            video_url = video_file.file_path  # Прямая ссылка на видео в Telegram
         else:
             # Если прислали текст с ссылкой
             data = update.message.text.split('|')
             if len(data) < 2:
-                await update.message.reply_text("Неверный формат данных. Нужно: Номер серии | Ссылка на видео")
+                await update.message.reply_text("Неверный формат данных. Нужно: Номер серии | Ссылка")
                 return
             
             episode_number = int(data[0].strip())
             video_url = data[1].strip()
+            
+            # Проверяем, является ли ссылка VK видео
+            vk_full_id = parse_vk_url(video_url)
+            if vk_full_id:
+                # Извлекаем owner_id и video_id
+                parts = vk_full_id.split('_')
+                if len(parts) == 2:
+                    vk_owner_id = parts[0]
+                    vk_video_id = parts[1]
+                    
+                    # Получаем прямую ссылку на видео
+                    direct_url = get_vk_video_url(vk_full_id)
+                    if direct_url:
+                        video_url = direct_url
+                        logger.info(f"Got direct VK video URL: {direct_url}")
+                    else:
+                        # Если не удалось получить прямую ссылку, используем оригинальный URL
+                        video_url = f"https://vk.com/video{vk_full_id}"
+                        logger.warning("Using VK page URL instead of direct link")
         
         # Сохраняем в базу
-        add_episode(anime_id, episode_number, video_url)
+        add_episode(anime_id, episode_number, video_url, vk_video_id, vk_owner_id)
         await update.message.reply_text(f"✅ Серия {episode_number} добавлена!")
         
         del context.user_data['selected_anime_id']
@@ -383,8 +500,8 @@ async def receive_episode_data(update: Update, context: ContextTypes.DEFAULT_TYP
     except ValueError:
         await update.message.reply_text("Номер серии должен быть числом")
     except Exception as e:
-        logger.error(f"Error adding episode: {e}")
-        await update.message.reply_text("Ошибка при добавлении серии")
+        logger.error(f"Error adding episode: {str(e)}")
+        await update.message.reply_text(f"Ошибка при добавлении серии: {str(e)}")
 
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -417,7 +534,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await show_admin_panel(query.message)
+    await show_admin_panel(update, context)
 
 # ===================== Главная функция =====================
 def main():
@@ -446,19 +563,4 @@ def main():
     # Админ-панель
     application.add_handler(CallbackQueryHandler(show_admin_panel, pattern="^admin_panel$"))
     application.add_handler(CallbackQueryHandler(add_anime_handler, pattern="^admin_add_anime$"))
-    application.add_handler(CallbackQueryHandler(add_episode_handler, pattern="^admin_add_episode$"))
-    application.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
-    application.add_handler(CallbackQueryHandler(select_anime_for_episode, pattern="^admin_episode_"))
-    application.add_handler(CallbackQueryHandler(admin_cancel, pattern="^admin_cancel$"))
-    
-    # Обработчики сообщений
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_anime_data))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_episode_data))
-    application.add_handler(MessageHandler(filters.VIDEO, receive_episode_data))
-    
-    # Запуск бота
-    logger.info("Starting bot...")
-    application.run_polling()
-
-if __name__ == '__main__':
-    main()
+    application.add_handler(CallbackQueryHandler(ad
