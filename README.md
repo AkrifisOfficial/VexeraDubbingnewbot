@@ -1,4 +1,4 @@
-# Аниме-бот для Telegram
+# Аниме-бот для Telegram (http://t.me/VexeraDubbingOnlineBot)
 
 Бот для просмотра аниме от озвучки VexeraDubbing с админ-панелью и статистикой.
 
