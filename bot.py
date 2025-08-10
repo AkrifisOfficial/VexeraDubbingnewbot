@@ -391,7 +391,12 @@ async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ===================== Главная функция =====================
 def main():
     # Инициализация базы данных
-    init_db()
+    try:
+        init_db()
+        logger.info("Database initialized successfully")
+    except Exception as e:
+        logger.error(f"Database initialization failed: {e}")
+        sys.exit(1)
     
     # Создание приложения
     application = Application.builder().token(BOT_TOKEN).build()
