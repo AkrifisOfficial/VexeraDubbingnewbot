@@ -3,7 +3,7 @@ import sys
 import logging
 from dotenv import load_dotenv
 import psycopg2
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -44,7 +44,6 @@ def get_connection():
 def init_db():
     with get_connection() as conn:
         with conn.cursor() as cursor:
-            # Таблица аниме
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS anime (
                     id SERIAL PRIMARY KEY,
@@ -55,7 +54,6 @@ def init_db():
                 )
             ''')
             
-            # Таблица эпизодов
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS episodes (
                     id SERIAL PRIMARY KEY,
@@ -66,7 +64,6 @@ def init_db():
                 )
             ''')
             
-            # Таблица пользователей
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
@@ -75,18 +72,40 @@ def init_db():
                 )
             ''')
             
-            # Таблица статистики просмотров
             cursor.execute('''
-                CREATE TABLE IF NOT EXISTS views (
+                CREATE TABLE IF NOT EXISTS stats (
                     id SERIAL PRIMARY KEY,
-                    user_id BIGINT,
-                    anime_id INTEGER,
-                    episode_id INTEGER,
-                    viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    total_users INTEGER DEFAULT 0,
+                    total_anime INTEGER DEFAULT 0,
+                    total_episodes INTEGER DEFAULT 0,
+                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
         conn.commit()
     logger.info("Database tables created or verified")
+
+def update_stats():
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM users")
+            users = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM anime")
+            anime = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM episodes")
+            episodes = cursor.fetchone()[0]
+            
+            cursor.execute('''
+                INSERT INTO stats (total_users, total_anime, total_episodes) 
+                VALUES (%s, %s, %s)
+                ON CONFLICT (id) DO UPDATE SET
+                total_users = EXCLUDED.total_users,
+                total_anime = EXCLUDED.total_anime,
+                total_episodes = EXCLUDED.total_episodes,
+                last_updated = CURRENT_TIMESTAMP
+            ''', (users, anime, episodes))
+            conn.commit()
 
 def add_anime(title, description, cover_url):
     with get_connection() as conn:
@@ -97,7 +116,7 @@ def add_anime(title, description, cover_url):
             )
             anime_id = cursor.fetchone()[0]
         conn.commit()
-    logger.info(f"Added anime: {title} (ID: {anime_id})")
+    update_stats()
     return anime_id
 
 def get_anime_list():
@@ -115,20 +134,18 @@ def get_anime_details(anime_id):
 def get_episodes(anime_id):
     with get_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT id, number, video_url FROM episodes WHERE anime_id = %s ORDER BY number", (anime_id,))
+            cursor.execute("SELECT number, video_url FROM episodes WHERE anime_id = %s ORDER BY number", (anime_id,))
             return cursor.fetchall()
 
 def add_episode(anime_id, number, video_url):
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO episodes (anime_id, number, video_url) VALUES (%s, %s, %s) RETURNING id",
+                "INSERT INTO episodes (anime_id, number, video_url) VALUES (%s, %s, %s)",
                 (anime_id, number, video_url)
             )
-            episode_id = cursor.fetchone()[0]
         conn.commit()
-    logger.info(f"Added episode {number} for anime ID {anime_id}")
-    return episode_id
+    update_stats()
 
 def set_admin(user_id):
     with get_connection() as conn:
@@ -139,7 +156,6 @@ def set_admin(user_id):
                 (user_id,)
             )
         conn.commit()
-    logger.info(f"Set admin privileges for user ID: {user_id}")
 
 def is_admin(user_id):
     with get_connection() as conn:
@@ -148,77 +164,14 @@ def is_admin(user_id):
             result = cursor.fetchone()
             return result and result[0]
 
-def get_bot_stats():
-    """Возвращает статистику бота в виде словаря"""
-    stats = {}
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            # Количество аниме
-            cursor.execute("SELECT COUNT(*) FROM anime")
-            stats['anime_count'] = cursor.fetchone()[0]
-            
-            # Количество серий
-            cursor.execute("SELECT COUNT(*) FROM episodes")
-            stats['episodes_count'] = cursor.fetchone()[0]
-            
-            # Количество пользователей
-            cursor.execute("SELECT COUNT(*) FROM users")
-            stats['users_count'] = cursor.fetchone()[0]
-            
-            # Количество администраторов
-            cursor.execute("SELECT COUNT(*) FROM users WHERE is_admin = TRUE")
-            stats['admins_count'] = cursor.fetchone()[0]
-            
-            # Количество просмотров
-            cursor.execute("SELECT COUNT(*) FROM views")
-            stats['views_count'] = cursor.fetchone()[0]
-            
-            # Последнее добавленное аниме
-            cursor.execute("SELECT title FROM anime ORDER BY created_at DESC LIMIT 1")
-            last_anime = cursor.fetchone()
-            stats['last_anime'] = last_anime[0] if last_anime else "Нет данных"
-            
-            # Последняя добавленная серия
-            cursor.execute("""
-                SELECT a.title, e.number 
-                FROM episodes e
-                JOIN anime a ON a.id = e.anime_id
-                ORDER BY e.added_at DESC 
-                LIMIT 1
-            """)
-            last_episode = cursor.fetchone()
-            if last_episode:
-                stats['last_episode'] = f"{last_episode[0]} - серия {last_episode[1]}"
-            else:
-                stats['last_episode'] = "Нет данных"
-    
-    return stats
-
 # ===================== Обработчики команд =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     await update.message.reply_text(
         f"Привет {user.first_name}!\n"
         "Я бот для просмотра аниме от озвучки VexeraDubbing.\n"
-        "Используй /menu для просмотра доступного аниме.\n"
-        "Используй /stats для просмотра статистики бота."
+        "Используй /menu для просмотра доступного аниме."
     )
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Показывает статистику бота для всех пользователей"""
-    stats = get_bot_stats()
-    
-    stats_text = (
-        "📊 <b>Статистика бота</b>\n\n"
-        f"• Аниме в базе: <b>{stats['anime_count']}</b>\n"
-        f"• Серий в базе: <b>{stats['episodes_count']}</b>\n"
-        f"• Пользователей: <b>{stats['users_count']}</b>\n"
-        f"• Просмотров: <b>{stats['views_count']}</b>\n\n"
-        f"<i>Последнее добавленное аниме:</i>\n{stats['last_anime']}\n"
-        f"<i>Последняя добавленная серия:</i>\n{stats['last_episode']}"
-    )
-    
-    await update.message.reply_text(stats_text, parse_mode="HTML")
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     anime_list = get_anime_list()
@@ -254,7 +207,7 @@ async def anime_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if episodes:
         episodes_buttons = [
             [InlineKeyboardButton(f"Серия {number}", callback_data=f"episode_{anime_id}_{number}")]
-            for _, number, _ in episodes
+            for number, _ in episodes
         ]
         keyboard = episodes_buttons
     else:
@@ -264,20 +217,20 @@ async def anime_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Редактируем текущее сообщение
-    await query.edit_message_text(
-        f"<b>{title}</b>\n\n{description}",
-        parse_mode="HTML",
-        reply_markup=reply_markup
-    )
-    
-    # Отправляем обложку отдельно
+    # Сначала отправляем постер с кнопками серий
     if cover_url:
         await context.bot.send_photo(
             chat_id=query.message.chat_id,
             photo=cover_url,
-            caption=f"Обложка: {title}",
-            reply_to_message_id=query.message.message_id
+            caption=f"<b>{title}</b>\n\n{description}",
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+    else:
+        await query.edit_message_text(
+            f"<b>{title}</b>\n\n{description}",
+            parse_mode="HTML",
+            reply_markup=reply_markup
         )
 
 async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -289,60 +242,72 @@ async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     episode_number = int(data[2])
     
     episodes = get_episodes(anime_id)
-    video_url = next((url for _, num, url in episodes if num == episode_number), None)
+    video_url = next((url for num, url in episodes if num == episode_number), None)
     
     if not video_url:
         await query.edit_message_text("Серия не найдена")
         return
     
-    # Отправляем видео или ссылку
-    if video_url.startswith("http"):
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=f"🎬 Серия {episode_number}:\n{video_url}"
-        )
-    else:
-        await context.bot.send_video(
-            chat_id=query.message.chat_id,
-            video=video_url,
-            caption=f"Серия {episode_number}",
-            supports_streaming=True
-        )
-    
-    # Сохраняем статистику просмотра
-    user_id = query.from_user.id
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute(
-                "INSERT INTO views (user_id, anime_id) VALUES (%s, %s)",
-                (user_id, anime_id)
+    # Отправляем видео прямо в Telegram
+    try:
+        if video_url.startswith("http"):
+            # Если это ссылка на видео
+            await context.bot.send_video(
+                chat_id=query.message.chat_id,
+                video=video_url,
+                caption=f"Серия {episode_number}",
+                supports_streaming=True
             )
-            conn.commit()
+        else:
+            # Если это file_id видео в Telegram
+            await context.bot.send_video(
+                chat_id=query.message.chat_id,
+                video=video_url,
+                caption=f"Серия {episode_number}",
+                supports_streaming=True
+            )
+    except Exception as e:
+        logger.error(f"Error sending video: {str(e)}")
+        await query.edit_message_text("Ошибка при отправке видео")
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    # Получаем список аниме
     anime_list = get_anime_list()
     
     if not anime_list:
         await query.edit_message_text("Аниме пока нет в базе данных.")
         return
     
-    # Создаем клавиатуру с аниме
     keyboard = [
         [InlineKeyboardButton(title, callback_data=f"anime_{id}")]
         for id, title in anime_list
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("Выберите аниме:", reply_markup=reply_markup)
+
+# ===================== Статистика =====================
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM stats ORDER BY last_updated DESC LIMIT 1")
+            stats = cursor.fetchone()
+            
+            if stats:
+                _, users, anime, episodes, updated = stats
+                message = (
+                    "📊 <b>Статистика бота</b>\n\n"
+                    f"👥 Пользователей: <b>{users}</b>\n"
+                    f"🎬 Аниме в базе: <b>{anime}</b>\n"
+                    f"📺 Серий в базе: <b>{episodes}</b>\n"
+                    f"🕒 Обновлено: <b>{updated.strftime('%Y-%m-%d %H:%M')}</b>"
+                )
+            else:
+                message = "Статистика пока недоступна"
     
-    # Редактируем текущее сообщение
-    await query.edit_message_text(
-        "Выберите аниме:",
-        reply_markup=reply_markup
-    )
+    await update.message.reply_text(message, parse_mode="HTML")
 
 # ===================== Админ-панель =====================
 async def admin_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -384,7 +349,6 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если команда вызвана из callback, редактируем сообщение
     if update.callback_query:
         await update.callback_query.edit_message_text(
             "Админ-панель:",
@@ -487,7 +451,7 @@ async def receive_episode_data(update: Update, context: ContextTypes.DEFAULT_TYP
                 
             episode_number = int(update.message.caption)
             video_file = await update.message.video.get_file()
-            video_url = video_file.file_path  # Прямая ссылка на видео в Telegram
+            video_url = video_file.file_id  # Сохраняем file_id для Telegram
         else:
             # Если прислали текст с ссылкой
             data = update.message.text.split('|')
@@ -499,7 +463,7 @@ async def receive_episode_data(update: Update, context: ContextTypes.DEFAULT_TYP
             video_url = data[1].strip()
         
         # Сохраняем в базу
-        episode_id = add_episode(anime_id, episode_number, video_url)
+        add_episode(anime_id, episode_number, video_url)
         await update.message.reply_text(f"✅ Серия {episode_number} добавлена!")
         
         del context.user_data['selected_anime_id']
@@ -518,20 +482,24 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Доступ запрещен")
         return
     
-    stats = get_bot_stats()
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM stats ORDER BY last_updated DESC LIMIT 1")
+            stats = cursor.fetchone()
+            
+            if stats:
+                _, users, anime, episodes, updated = stats
+                message = (
+                    "📊 <b>Статистика бота</b>\n\n"
+                    f"👥 Пользователей: <b>{users}</b>\n"
+                    f"🎬 Аниме в базе: <b>{anime}</b>\n"
+                    f"📺 Серий в базе: <b>{episodes}</b>\n"
+                    f"🕒 Обновлено: <b>{updated.strftime('%Y-%m-%d %H:%M')}</b>"
+                )
+            else:
+                message = "Статистика пока недоступна"
     
-    stats_text = (
-        "👑 <b>Админская статистика</b>\n\n"
-        f"• Аниме в базе: <b>{stats['anime_count']}</b>\n"
-        f"• Серий в базе: <b>{stats['episodes_count']}</b>\n"
-        f"• Пользователей: <b>{stats['users_count']}</b>\n"
-        f"• Администраторов: <b>{stats['admins_count']}</b>\n"
-        f"• Просмотров: <b>{stats['views_count']}</b>\n\n"
-        f"<i>Последнее добавленное аниме:</i>\n{stats['last_anime']}\n"
-        f"<i>Последняя добавленная серия:</i>\n{stats['last_episode']}"
-    )
-    
-    await query.edit_message_text(stats_text, parse_mode="HTML")
+    await query.edit_message_text(message, parse_mode="HTML")
 
 async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -540,9 +508,10 @@ async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===================== Главная функция =====================
 def main():
-    # Инициализация базы данных с обработкой ошибок
+    # Инициализация базы данных
     try:
         init_db()
+        update_stats()  # Первоначальное обновление статистики
         logger.info("Database initialized successfully")
     except Exception as e:
         logger.error(f"Database initialization failed: {e}")
@@ -556,7 +525,7 @@ def main():
     application.add_handler(CommandHandler("menu", menu))
     application.add_handler(CommandHandler("auth", admin_auth))
     application.add_handler(CommandHandler("admin", admin_command))
-    application.add_handler(CommandHandler("stats", stats_command))  # Новая команда
+    application.add_handler(CommandHandler("stats", stats_command))  # Новая команда статистики
     
     # Обработчики CallbackQuery
     application.add_handler(CallbackQueryHandler(anime_details, pattern="^anime_"))
@@ -580,5 +549,4 @@ def main():
     logger.info("Starting bot...")
     application.run_polling()
 
-if __name__ == '__main__':
-    main()
+if __name__ == '__main
