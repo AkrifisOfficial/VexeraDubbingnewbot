@@ -1,15 +1,9 @@
 import os
 import sys
 import logging
-import subprocess
 from dotenv import load_dotenv
 import psycopg2
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InputMediaPhoto
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -19,17 +13,21 @@ from telegram.ext import (
     filters
 )
 
-# Загружаем переменные окружения
+# Загружаем переменные окружения из .env
 load_dotenv()
 
-# Конфигурация
+# Загрузка переменных окружения
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
 DATABASE_URL = os.getenv('DATABASE_URL')
 
-# Проверка конфигурации
-if not all([BOT_TOKEN, DATABASE_URL]):
-    print("ERROR: Missing required environment variables!")
+# Проверка переменных
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN not set!")
+    sys.exit(1)
+
+if not DATABASE_URL:
+    print("ERROR: DATABASE_URL not set!")
     sys.exit(1)
 
 # Настройка логгирования
@@ -39,7 +37,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ===================== Database Functions =====================
+# ===================== Функции работы с PostgreSQL =====================
 def get_connection():
     return psycopg2.connect(DATABASE_URL, sslmode='require')
 
@@ -61,7 +59,6 @@ def init_db():
                     anime_id INTEGER REFERENCES anime(id) ON DELETE CASCADE,
                     number INTEGER NOT NULL,
                     video_url TEXT NOT NULL,
-                    file_id TEXT,
                     added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
@@ -73,81 +70,134 @@ def init_db():
                 )
             ''')
         conn.commit()
-    logger.info("Database initialized")
+    logger.info("Database tables created or verified")
 
-# ... (остальные database functions остаются без изменений)
-
-# ===================== Video Processing =====================
-def compress_video(input_path, output_path, target_size_mb=45):
-    """Сжимает видео до указанного размера"""
-    try:
-        duration = float(subprocess.check_output(
-            f"ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 {input_path}",
-            shell=True
-        ).decode().strip())
-        
-        target_size_kb = target_size_mb * 8000
-        bitrate = int(target_size_kb / duration)
-        
-        subprocess.run([
-            'ffmpeg', '-i', input_path,
-            '-vcodec', 'libx264',
-            '-crf', '28',
-            '-preset', 'fast',
-            '-acodec', 'aac',
-            '-b:v', f'{bitrate}k',
-            output_path
-        ], check=True)
-        return True
-    except Exception as e:
-        logger.error(f"Video compression failed: {e}")
-        return False
-
-async def upload_video_to_telegram(update: Update, context: ContextTypes.DEFAULT_TYPE, video_url: str, anime_id: int, episode_number: int):
-    """Загружает видео в Telegram и возвращает file_id"""
-    try:
-        # Скачивание видео (реализация зависит от источника)
-        # Здесь должен быть код для скачивания видео по URL
-        # Например, используя yt-dlp или requests
-        
-        # Временные файлы
-        input_path = f"temp_{anime_id}_{episode_number}.mp4"
-        output_path = f"compressed_{anime_id}_{episode_number}.mp4"
-        
-        # Сжатие видео
-        if not compress_video(input_path, output_path):
-            raise Exception("Video compression failed")
-        
-        # Загрузка в Telegram
-        with open(output_path, 'rb') as video_file:
-            message = await context.bot.send_video(
-                chat_id=update.effective_chat.id,
-                video=video_file,
-                caption=f"🎬 Серия {episode_number}",
-                supports_streaming=True
+def add_anime(title, description, cover_url):
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO anime (title, description, cover_url) VALUES (%s, %s, %s) RETURNING id",
+                (title, description, cover_url)
             )
-        
-        # Сохраняем file_id в базу
-        with get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute(
-                    "UPDATE episodes SET file_id = %s WHERE anime_id = %s AND number = %s",
-                    (message.video.file_id, anime_id, episode_number)
-                )
-            conn.commit()
-        
-        # Удаляем временные файлы
-        os.remove(input_path)
-        os.remove(output_path)
-        
-        return message.video.file_id
-    except Exception as e:
-        logger.error(f"Video upload failed: {e}")
-        return None
+            anime_id = cursor.fetchone()[0]
+        conn.commit()
+    logger.info(f"Added anime: {title} (ID: {anime_id})")
+    return anime_id
 
-# ===================== Handlers =====================
+def get_anime_list():
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, title FROM anime ORDER BY title")
+            return cursor.fetchall()
+
+def get_anime_details(anime_id):
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM anime WHERE id = %s", (anime_id,))
+            return cursor.fetchone()
+
+def get_episodes(anime_id):
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT number, video_url FROM episodes WHERE anime_id = %s ORDER BY number", (anime_id,))
+            return cursor.fetchall()
+
+def add_episode(anime_id, number, video_url):
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO episodes (anime_id, number, video_url) VALUES (%s, %s, %s)",
+                (anime_id, number, video_url)
+            )
+        conn.commit()
+    logger.info(f"Added episode {number} for anime ID {anime_id}")
+
+def set_admin(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO users (user_id, is_admin) VALUES (%s, TRUE) "
+                "ON CONFLICT (user_id) DO UPDATE SET is_admin = EXCLUDED.is_admin",
+                (user_id,)
+            )
+        conn.commit()
+    logger.info(f"Set admin privileges for user ID: {user_id}")
+
+def is_admin(user_id):
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT is_admin FROM users WHERE user_id = %s", (user_id,))
+            result = cursor.fetchone()
+            return result and result[0]
+
+# ===================== Обработчики команд =====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await update.message.reply_text(
+        f"Привет {user.first_name}!\n"
+        "Я бот для просмотра аниме от озвучки VexeraDubbing.\n"
+        "Используй /menu для просмотра доступного аниме."
+    )
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    anime_list = get_anime_list()
+    
+    if not anime_list:
+        await update.message.reply_text("Аниме пока нет в базе данных.")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton(title, callback_data=f"anime_{id}")]
+        for id, title in anime_list
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("Выберите аниме:", reply_markup=reply_markup)
+
+async def anime_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    anime_id = int(query.data.split('_')[1])
+    anime = get_anime_details(anime_id)
+    
+    if not anime:
+        await query.edit_message_text("Аниме не найдено")
+        return
+    
+    _, title, description, cover_url = anime
+    
+    episodes = get_episodes(anime_id)
+    
+    if episodes:
+        episodes_buttons = [
+            [InlineKeyboardButton(f"Серия {number}", callback_data=f"episode_{anime_id}_{number}")]
+            for number, _ in episodes
+        ]
+        keyboard = episodes_buttons
+    else:
+        keyboard = []
+    
+    keyboard.append([InlineKeyboardButton("Назад к списку", callback_data="back_to_menu")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"<b>{title}</b>\n\n{description}",
+        parse_mode="HTML",
+        reply_markup=reply_markup
+    )
+    
+    if cover_url:
+        await context.bot.send_photo(
+            chat_id=query.message.chat_id,
+            photo=cover_url,
+            caption=f"🎬 <b>{title}</b>",
+            parse_mode="HTML",
+            reply_to_message_id=query.message.message_id
+        )
+
 async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик просмотра серии"""
     query = update.callback_query
     await query.answer()
     
@@ -156,28 +206,24 @@ async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     episode_number = int(data[2])
     
     episodes = get_episodes(anime_id)
-    video_data = next((ep for ep in episodes if ep[0] == episode_number), None)
+    video_url = next((url for num, url in episodes if num == episode_number), None)
     
-    if not video_data:
+    if not video_url:
         await query.edit_message_text("Серия не найдена")
         return
     
-    _, video_url, file_id = video_data
     anime = get_anime_details(anime_id)
     anime_title = anime[1] if anime else "Неизвестное аниме"
     
-    # Проверяем, является ли видео из ВК
     is_vk_video = "vk.com" in video_url.lower()
     
     if is_vk_video:
-        # Создаем клавиатуру с кнопками
         keyboard = [
             [InlineKeyboardButton("▶️ Смотреть в ВК", url=video_url)],
-            [InlineKeyboardButton("🔙 Назад к аниме", callback_data=f"anime_{anime_id}")]
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"anime_{anime_id}")]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Отправляем постер с кнопками
         await context.bot.send_photo(
             chat_id=query.message.chat_id,
             photo=anime[3] if anime and anime[3] else None,
@@ -185,26 +231,235 @@ async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="HTML",
             reply_markup=reply_markup
         )
-    elif file_id:
-        # Отправляем видео из Telegram
+    elif video_url.startswith("http"):
+        await context.bot.send_photo(
+            chat_id=query.message.chat_id,
+            photo=anime[3] if anime and anime[3] else None,
+            caption=f"🎬 <b>{anime_title}</b>\n🔹 Серия {episode_number}\n\nСсылка: {video_url}",
+            parse_mode="HTML"
+        )
+    else:
         await context.bot.send_video(
             chat_id=query.message.chat_id,
-            video=file_id,
+            video=video_url,
             caption=f"🎬 <b>{anime_title}</b>\n🔹 Серия {episode_number}",
             parse_mode="HTML",
             supports_streaming=True
         )
+
+async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    anime_list = get_anime_list()
+    
+    if not anime_list:
+        await query.edit_message_text("Аниме пока нет в базе данных.")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton(title, callback_data=f"anime_{id}")]
+        for id, title in anime_list
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("Выберите аниме:", reply_markup=reply_markup)
+
+# ===================== Админ-панель =====================
+async def admin_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    args = context.args
+    
+    if not args:
+        await update.message.reply_text("Использование: /auth <пароль>")
+        return
+    
+    if args[0] == ADMIN_PASSWORD:
+        set_admin(user_id)
+        await update.message.reply_text("✅ Вы вошли в админ-панель!")
+        await show_admin_panel(update, context)
     else:
-        # Просто отправляем ссылку
-        await context.bot.send_message(
-            chat_id=query.message.chat_id,
-            text=f"🎬 <b>{anime_title}</b>\n🔹 Серия {episode_number}\n\nСсылка: {video_url}",
-            parse_mode="HTML"
+        await update.message.reply_text("❌ Неверный пароль")
+
+async def admin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if is_admin(user_id):
+        await show_admin_panel(update, context)
+    else:
+        await update.message.reply_text(
+            "❌ Вы не администратор!\n"
+            "Используйте команду /auth <пароль> для доступа."
         )
 
-# ... (остальные handlers остаются без изменений)
+async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await update.message.reply_text("Доступ запрещен")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton("Добавить аниме", callback_data="admin_add_anime")],
+        [InlineKeyboardButton("Добавить серию", callback_data="admin_add_episode")],
+        [InlineKeyboardButton("Статистика", callback_data="admin_stats")]
+    ]
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    if update.callback_query:
+        await update.callback_query.edit_message_text(
+            "Админ-панель:",
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text("Админ-панель:", reply_markup=reply_markup)
 
-# ===================== Main =====================
+async def add_anime_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if not is_admin(query.from_user.id):
+        await query.edit_message_text("Доступ запрещен")
+        return
+    
+    await query.edit_message_text(
+        "Отправьте данные в формате:\n"
+        "<b>Название | Описание | URL обложки</b>\n\n"
+        "Пример:\n"
+        "Наруто | История о ниндзя | https://example.com/cover.jpg",
+        parse_mode="HTML"
+    )
+    context.user_data['awaiting_anime_data'] = True
+
+async def add_episode_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if not is_admin(query.from_user.id):
+        await query.edit_message_text("Доступ запрещен")
+        return
+    
+    anime_list = get_anime_list()
+    if not anime_list:
+        await query.edit_message_text("Сначала добавьте аниме")
+        return
+    
+    keyboard = [
+        [InlineKeyboardButton(title, callback_data=f"admin_episode_{id}")]
+        for id, title in anime_list
+    ]
+    keyboard.append([InlineKeyboardButton("Отмена", callback_data="admin_cancel")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await query.edit_message_text("Выберите аниме:", reply_markup=reply_markup)
+
+async def receive_anime_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'awaiting_anime_data' not in context.user_data:
+        return
+    
+    try:
+        data = update.message.text.split('|')
+        if len(data) < 3:
+            await update.message.reply_text("Неверный формат данных. Нужно: Название | Описание | URL обложки")
+            return
+        
+        title = data[0].strip()
+        description = data[1].strip()
+        cover_url = data[2].strip()
+        
+        anime_id = add_anime(title, description, cover_url)
+        await update.message.reply_text(f"✅ Аниме '{title}' добавлено! ID: {anime_id}")
+        del context.user_data['awaiting_anime_data']
+        
+    except Exception as e:
+        logger.error(f"Error adding anime: {e}")
+        await update.message.reply_text("Ошибка при добавлении аниме")
+
+async def select_anime_for_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    anime_id = int(query.data.split('_')[2])
+    context.user_data['selected_anime_id'] = anime_id
+    
+    await query.edit_message_text(
+        "Отправьте номер серии и видео одним из способов:\n"
+        "1. Ссылку на видео (ВК, YouTube и т.д.)\n"
+        "2. Видеофайл с подписью\n\n"
+        "Пример для ссылки:\n"
+        "1 | https://vk.com/video-123456_789\n\n"
+        "Пример для видеофайла:\n"
+        "1 (в подписи к видео)",
+        parse_mode="HTML"
+    )
+
+async def receive_episode_data(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'selected_anime_id' not in context.user_data:
+        return
+    
+    try:
+        anime_id = context.user_data['selected_anime_id']
+        
+        if update.message.video:
+            if not update.message.caption:
+                await update.message.reply_text("Отправьте номер серии в подписи к видео")
+                return
+                
+            episode_number = int(update.message.caption)
+            video_file = await update.message.video.get_file()
+            video_url = video_file.file_path
+        else:
+            data = update.message.text.split('|')
+            if len(data) < 2:
+                await update.message.reply_text("Неверный формат данных. Нужно: Номер серии | Ссылка")
+                return
+            
+            episode_number = int(data[0].strip())
+            video_url = data[1].strip()
+        
+        add_episode(anime_id, episode_number, video_url)
+        await update.message.reply_text(f"✅ Серия {episode_number} добавлена!")
+        del context.user_data['selected_anime_id']
+        
+    except ValueError:
+        await update.message.reply_text("Номер серии должен быть числом")
+    except Exception as e:
+        logger.error(f"Error adding episode: {str(e)}")
+        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+
+async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if not is_admin(query.from_user.id):
+        await query.edit_message_text("Доступ запрещен")
+        return
+    
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM anime")
+            anime_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM episodes")
+            episodes_count = cursor.fetchone()[0]
+            
+            cursor.execute("SELECT COUNT(*) FROM users WHERE is_admin = TRUE")
+            admins_count = cursor.fetchone()[0]
+    
+    stats_text = (
+        "📊 Статистика бота:\n"
+        f"• Аниме в базе: {anime_count}\n"
+        f"• Серий в базе: {episodes_count}\n"
+        f"• Администраторов: {admins_count}"
+    )
+    
+    await query.edit_message_text(stats_text)
+
+async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await show_admin_panel(update, context)
+
+# ===================== Главная функция =====================
 def main():
     try:
         init_db()
@@ -215,7 +470,6 @@ def main():
     
     application = Application.builder().token(BOT_TOKEN).build()
     
-    # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("menu", menu))
     application.add_handler(CommandHandler("auth", admin_auth))
@@ -225,7 +479,6 @@ def main():
     application.add_handler(CallbackQueryHandler(watch_episode, pattern="^episode_"))
     application.add_handler(CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"))
     
-    # Админ-панель
     application.add_handler(CallbackQueryHandler(show_admin_panel, pattern="^admin_panel$"))
     application.add_handler(CallbackQueryHandler(add_anime_handler, pattern="^admin_add_anime$"))
     application.add_handler(CallbackQueryHandler(add_episode_handler, pattern="^admin_add_episode$"))
@@ -233,7 +486,6 @@ def main():
     application.add_handler(CallbackQueryHandler(select_anime_for_episode, pattern="^admin_episode_"))
     application.add_handler(CallbackQueryHandler(admin_cancel, pattern="^admin_cancel$"))
     
-    # Обработчики сообщений
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_anime_data))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_episode_data))
     application.add_handler(MessageHandler(filters.VIDEO, receive_episode_data))
