@@ -1,10 +1,8 @@
 import os
 import sys
-import re
 import logging
 from dotenv import load_dotenv
 import psycopg2
-import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -22,7 +20,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
 DATABASE_URL = os.getenv('DATABASE_URL')
-VK_ACCESS_TOKEN = os.getenv('VK_ACCESS_TOKEN')  # Токен для VK API
 
 # Проверка переменных
 if not BOT_TOKEN:
@@ -47,28 +44,45 @@ def get_connection():
 def init_db():
     with get_connection() as conn:
         with conn.cursor() as cursor:
+            # Таблица аниме
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS anime (
                     id SERIAL PRIMARY KEY,
                     title TEXT NOT NULL,
                     description TEXT,
-                    cover_url TEXT
+                    cover_url TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            
+            # Таблица эпизодов
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS episodes (
                     id SERIAL PRIMARY KEY,
                     anime_id INTEGER REFERENCES anime(id) ON DELETE CASCADE,
                     number INTEGER NOT NULL,
                     video_url TEXT NOT NULL,
-                    vk_video_id TEXT,
-                    vk_owner_id TEXT
+                    added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            
+            # Таблица пользователей
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     user_id BIGINT PRIMARY KEY,
-                    is_admin BOOLEAN DEFAULT FALSE
+                    is_admin BOOLEAN DEFAULT FALSE,
+                    last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Таблица статистики просмотров
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS views (
+                    id SERIAL PRIMARY KEY,
+                    user_id BIGINT,
+                    anime_id INTEGER,
+                    episode_id INTEGER,
+                    viewed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
         conn.commit()
@@ -101,18 +115,20 @@ def get_anime_details(anime_id):
 def get_episodes(anime_id):
     with get_connection() as conn:
         with conn.cursor() as cursor:
-            cursor.execute("SELECT number, video_url, vk_video_id, vk_owner_id FROM episodes WHERE anime_id = %s ORDER BY number", (anime_id,))
+            cursor.execute("SELECT id, number, video_url FROM episodes WHERE anime_id = %s ORDER BY number", (anime_id,))
             return cursor.fetchall()
 
-def add_episode(anime_id, number, video_url, vk_video_id=None, vk_owner_id=None):
+def add_episode(anime_id, number, video_url):
     with get_connection() as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "INSERT INTO episodes (anime_id, number, video_url, vk_video_id, vk_owner_id) VALUES (%s, %s, %s, %s, %s)",
-                (anime_id, number, video_url, vk_video_id, vk_owner_id)
+                "INSERT INTO episodes (anime_id, number, video_url) VALUES (%s, %s, %s) RETURNING id",
+                (anime_id, number, video_url)
             )
+            episode_id = cursor.fetchone()[0]
         conn.commit()
     logger.info(f"Added episode {number} for anime ID {anime_id}")
+    return episode_id
 
 def set_admin(user_id):
     with get_connection() as conn:
@@ -132,48 +148,51 @@ def is_admin(user_id):
             result = cursor.fetchone()
             return result and result[0]
 
-# ===================== Функции для работы с VK =====================
-def parse_vk_url(url):
-    """Извлекает owner_id и video_id из URL ВКонтакте"""
-    pattern = r'vk\.com\/video(-?\d+_\d+)'
-    match = re.search(pattern, url)
-    if match:
-        return match.group(1)
-    return None
-
-def get_vk_video_url(video_id):
-    """Получает прямую ссылку на видео через VK API"""
-    if not VK_ACCESS_TOKEN:
-        logger.warning("VK_ACCESS_TOKEN not set! Cannot get direct video link.")
-        return None
-    
-    try:
-        response = requests.get(
-            "https://api.vk.com/method/video.get",
-            params={
-                "access_token": VK_ACCESS_TOKEN,
-                "videos": video_id,
-                "v": "5.131"
-            }
-        ).json()
-        
-        if 'response' in response and 'items' in response['response']:
-            video = response['response']['items'][0]
-            # Ищем ссылку на видео с максимальным качеством
-            if 'files' in video:
-                # Приоритет: 1080p -> 720p -> 480p -> 360p
-                for quality in ['mp4_1080', 'mp4_720', 'mp4_480', 'mp4_360']:
-                    if quality in video['files']:
-                        return video['files'][quality]
+def get_bot_stats():
+    """Возвращает статистику бота в виде словаря"""
+    stats = {}
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            # Количество аниме
+            cursor.execute("SELECT COUNT(*) FROM anime")
+            stats['anime_count'] = cursor.fetchone()[0]
             
-            # Если нет прямых ссылок, возвращаем ссылку на плеер
-            return f"https://vk.com/video{video_id}"
-        
-        logger.error(f"VK API error: {response.get('error', 'Unknown error')}")
-        return None
-    except Exception as e:
-        logger.error(f"Error getting VK video: {str(e)}")
-        return None
+            # Количество серий
+            cursor.execute("SELECT COUNT(*) FROM episodes")
+            stats['episodes_count'] = cursor.fetchone()[0]
+            
+            # Количество пользователей
+            cursor.execute("SELECT COUNT(*) FROM users")
+            stats['users_count'] = cursor.fetchone()[0]
+            
+            # Количество администраторов
+            cursor.execute("SELECT COUNT(*) FROM users WHERE is_admin = TRUE")
+            stats['admins_count'] = cursor.fetchone()[0]
+            
+            # Количество просмотров
+            cursor.execute("SELECT COUNT(*) FROM views")
+            stats['views_count'] = cursor.fetchone()[0]
+            
+            # Последнее добавленное аниме
+            cursor.execute("SELECT title FROM anime ORDER BY created_at DESC LIMIT 1")
+            last_anime = cursor.fetchone()
+            stats['last_anime'] = last_anime[0] if last_anime else "Нет данных"
+            
+            # Последняя добавленная серия
+            cursor.execute("""
+                SELECT a.title, e.number 
+                FROM episodes e
+                JOIN anime a ON a.id = e.anime_id
+                ORDER BY e.added_at DESC 
+                LIMIT 1
+            """)
+            last_episode = cursor.fetchone()
+            if last_episode:
+                stats['last_episode'] = f"{last_episode[0]} - серия {last_episode[1]}"
+            else:
+                stats['last_episode'] = "Нет данных"
+    
+    return stats
 
 # ===================== Обработчики команд =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -181,8 +200,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"Привет {user.first_name}!\n"
         "Я бот для просмотра аниме от озвучки VexeraDubbing.\n"
-        "Используй /menu для просмотра доступного аниме."
+        "Используй /menu для просмотра доступного аниме.\n"
+        "Используй /stats для просмотра статистики бота."
     )
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает статистику бота для всех пользователей"""
+    stats = get_bot_stats()
+    
+    stats_text = (
+        "📊 <b>Статистика бота</b>\n\n"
+        f"• Аниме в базе: <b>{stats['anime_count']}</b>\n"
+        f"• Серий в базе: <b>{stats['episodes_count']}</b>\n"
+        f"• Пользователей: <b>{stats['users_count']}</b>\n"
+        f"• Просмотров: <b>{stats['views_count']}</b>\n\n"
+        f"<i>Последнее добавленное аниме:</i>\n{stats['last_anime']}\n"
+        f"<i>Последняя добавленная серия:</i>\n{stats['last_episode']}"
+    )
+    
+    await update.message.reply_text(stats_text, parse_mode="HTML")
 
 async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     anime_list = get_anime_list()
@@ -218,7 +254,7 @@ async def anime_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if episodes:
         episodes_buttons = [
             [InlineKeyboardButton(f"Серия {number}", callback_data=f"episode_{anime_id}_{number}")]
-            for number, _, _, _ in episodes
+            for _, number, _ in episodes
         ]
         keyboard = episodes_buttons
     else:
@@ -228,14 +264,14 @@ async def anime_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Редактируем текущее сообщение вместо отправки нового
+    # Редактируем текущее сообщение
     await query.edit_message_text(
         f"<b>{title}</b>\n\n{description}",
         parse_mode="HTML",
         reply_markup=reply_markup
     )
     
-    # Отправляем обложку отдельно, если она есть
+    # Отправляем обложку отдельно
     if cover_url:
         await context.bot.send_photo(
             chat_id=query.message.chat_id,
@@ -253,30 +289,13 @@ async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     episode_number = int(data[2])
     
     episodes = get_episodes(anime_id)
-    video_url = None
-    vk_video_id = None
-    vk_owner_id = None
-    
-    # Ищем нужную серию
-    for num, url, vid, oid in episodes:
-        if num == episode_number:
-            video_url = url
-            vk_video_id = vid
-            vk_owner_id = oid
-            break
+    video_url = next((url for _, num, url in episodes if num == episode_number), None)
     
     if not video_url:
         await query.edit_message_text("Серия не найдена")
         return
     
-    # Если это VK видео, попробуем получить прямую ссылку
-    if vk_video_id and vk_owner_id:
-        full_vk_id = f"{vk_owner_id}_{vk_video_id}"
-        direct_url = get_vk_video_url(full_vk_id)
-        if direct_url:
-            video_url = direct_url
-    
-    # Проверяем тип ссылки
+    # Отправляем видео или ссылку
     if video_url.startswith("http"):
         await context.bot.send_message(
             chat_id=query.message.chat_id,
@@ -289,6 +308,16 @@ async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             caption=f"Серия {episode_number}",
             supports_streaming=True
         )
+    
+    # Сохраняем статистику просмотра
+    user_id = query.from_user.id
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO views (user_id, anime_id) VALUES (%s, %s)",
+                (user_id, anime_id)
+            )
+            conn.commit()
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -433,14 +462,13 @@ async def select_anime_for_episode(update: Update, context: ContextTypes.DEFAULT
     context.user_data['selected_anime_id'] = anime_id
     
     await query.edit_message_text(
-        "Отправьте номер серии и один из вариантов:\n"
-        "1. Ссылку на видео ВКонтакте (например: https://vk.com/video-12345678_456239017)\n"
-        "2. Прямую ссылку на видеофайл\n"
-        "3. Видеофайл с подписью в формате: <b>Номер серии</b>\n\n"
-        "Пример для VK:\n"
-        "1 | https://vk.com/video-12345678_456239017\n\n"
-        "Пример для прямой ссылки:\n"
-        "1 | https://example.com/episode1.mp4",
+        "Отправьте номер серии и видео одним из способов:\n"
+        "1. Ссылку на видео (любой источник)\n"
+        "2. Видеофайл с подписью\n\n"
+        "Пример для ссылки:\n"
+        "1 | https://example.com/episode1.mp4\n\n"
+        "Пример для видеофайла:\n"
+        "1 (в подписи к видео)",
         parse_mode="HTML"
     )
 
@@ -450,8 +478,6 @@ async def receive_episode_data(update: Update, context: ContextTypes.DEFAULT_TYP
     
     try:
         anime_id = context.user_data['selected_anime_id']
-        vk_video_id = None
-        vk_owner_id = None
         
         if update.message.video:
             # Если прислали видеофайл
@@ -471,28 +497,9 @@ async def receive_episode_data(update: Update, context: ContextTypes.DEFAULT_TYP
             
             episode_number = int(data[0].strip())
             video_url = data[1].strip()
-            
-            # Проверяем, является ли ссылка VK видео
-            vk_full_id = parse_vk_url(video_url)
-            if vk_full_id:
-                # Извлекаем owner_id и video_id
-                parts = vk_full_id.split('_')
-                if len(parts) == 2:
-                    vk_owner_id = parts[0]
-                    vk_video_id = parts[1]
-                    
-                    # Получаем прямую ссылку на видео
-                    direct_url = get_vk_video_url(vk_full_id)
-                    if direct_url:
-                        video_url = direct_url
-                        logger.info(f"Got direct VK video URL: {direct_url}")
-                    else:
-                        # Если не удалось получить прямую ссылку, используем оригинальный URL
-                        video_url = f"https://vk.com/video{vk_full_id}"
-                        logger.warning("Using VK page URL instead of direct link")
         
         # Сохраняем в базу
-        add_episode(anime_id, episode_number, video_url, vk_video_id, vk_owner_id)
+        episode_id = add_episode(anime_id, episode_number, video_url)
         await update.message.reply_text(f"✅ Серия {episode_number} добавлена!")
         
         del context.user_data['selected_anime_id']
@@ -511,25 +518,20 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Доступ запрещен")
         return
     
-    with get_connection() as conn:
-        with conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) FROM anime")
-            anime_count = cursor.fetchone()[0]
-            
-            cursor.execute("SELECT COUNT(*) FROM episodes")
-            episodes_count = cursor.fetchone()[0]
-            
-            cursor.execute("SELECT COUNT(*) FROM users WHERE is_admin = TRUE")
-            admins_count = cursor.fetchone()[0]
+    stats = get_bot_stats()
     
     stats_text = (
-        "📊 Статистика бота:\n"
-        f"• Аниме в базе: {anime_count}\n"
-        f"• Серий в базе: {episodes_count}\n"
-        f"• Администраторов: {admins_count}"
+        "👑 <b>Админская статистика</b>\n\n"
+        f"• Аниме в базе: <b>{stats['anime_count']}</b>\n"
+        f"• Серий в базе: <b>{stats['episodes_count']}</b>\n"
+        f"• Пользователей: <b>{stats['users_count']}</b>\n"
+        f"• Администраторов: <b>{stats['admins_count']}</b>\n"
+        f"• Просмотров: <b>{stats['views_count']}</b>\n\n"
+        f"<i>Последнее добавленное аниме:</i>\n{stats['last_anime']}\n"
+        f"<i>Последняя добавленная серия:</i>\n{stats['last_episode']}"
     )
     
-    await query.edit_message_text(stats_text)
+    await query.edit_message_text(stats_text, parse_mode="HTML")
 
 async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -554,6 +556,7 @@ def main():
     application.add_handler(CommandHandler("menu", menu))
     application.add_handler(CommandHandler("auth", admin_auth))
     application.add_handler(CommandHandler("admin", admin_command))
+    application.add_handler(CommandHandler("stats", stats_command))  # Новая команда
     
     # Обработчики CallbackQuery
     application.add_handler(CallbackQueryHandler(anime_details, pattern="^anime_"))
@@ -561,6 +564,4 @@ def main():
     application.add_handler(CallbackQueryHandler(back_to_menu, pattern="^back_to_menu$"))
     
     # Админ-панель
-    application.add_handler(CallbackQueryHandler(show_admin_panel, pattern="^admin_panel$"))
-    application.add_handler(CallbackQueryHandler(add_anime_handler, pattern="^admin_add_anime$"))
-    application.add_handler(CallbackQueryHandler(ad
+    application.add_handler(C
