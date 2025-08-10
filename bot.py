@@ -1,19 +1,26 @@
 import os
-import sqlite3
+import sys
 import logging
-from telegram import (
-    Update, 
-    InlineKeyboardButton, 
-    InlineKeyboardMarkup
-)
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    MessageHandler,
-    filters
-)
+from dotenv import load_dotenv
+import psycopg2
+from psycopg2 import sql
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+
+# Загрузка переменных окружения
+load_dotenv()
+BOT_TOKEN = os.getenv('BOT_TOKEN')
+ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
+DATABASE_URL = os.getenv('DATABASE_URL')  # Новая переменная для PostgreSQL
+
+# Проверка переменных
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN not set!")
+    sys.exit(1)
+
+if not DATABASE_URL:
+    print("ERROR: DATABASE_URL not set!")
+    sys.exit(1)
 
 # Настройка логгирования
 logging.basicConfig(
@@ -22,107 +29,88 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Загрузка переменных окружения
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD')
+# ===================== Функции работы с PostgreSQL =====================
+def get_connection():
+    return psycopg2.connect(DATABASE_URL, sslmode='require')
 
-# Инициализация базы данных
 def init_db():
-    conn = sqlite3.connect('anime.db')
-    cursor = conn.cursor()
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS anime (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        description TEXT,
-        cover_url TEXT
-    )
-    ''')
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS episodes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        anime_id INTEGER,
-        number INTEGER,
-        video_url TEXT,
-        FOREIGN KEY(anime_id) REFERENCES anime(id)
-    )
-    ''')
-    
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS users (
-        user_id INTEGER PRIMARY KEY,
-        is_admin BOOLEAN DEFAULT 0
-    )
-    ''')
-    
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS anime (
+                    id SERIAL PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    cover_url TEXT
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS episodes (
+                    id SERIAL PRIMARY KEY,
+                    anime_id INTEGER REFERENCES anime(id) ON DELETE CASCADE,
+                    number INTEGER NOT NULL,
+                    video_url TEXT NOT NULL
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id BIGINT PRIMARY KEY,
+                    is_admin BOOLEAN DEFAULT FALSE
+                )
+            ''')
+        conn.commit()
 
-# Функции работы с БД
 def add_anime(title, description, cover_url):
-    conn = sqlite3.connect('anime.db')
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO anime (title, description, cover_url) VALUES (?, ?, ?)",
-        (title, description, cover_url)
-    )
-    conn.commit()
-    conn.close()
-    return cursor.lastrowid
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO anime (title, description, cover_url) VALUES (%s, %s, %s) RETURNING id",
+                (title, description, cover_url)
+            anime_id = cursor.fetchone()[0]
+        conn.commit()
+    return anime_id
 
 def get_anime_list():
-    conn = sqlite3.connect('anime.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, title FROM anime")
-    anime_list = cursor.fetchall()
-    conn.close()
-    return anime_list
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT id, title FROM anime")
+            return cursor.fetchall()
 
 def get_anime_details(anime_id):
-    conn = sqlite3.connect('anime.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM anime WHERE id = ?", (anime_id,))
-    anime = cursor.fetchone()
-    conn.close()
-    return anime
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT * FROM anime WHERE id = %s", (anime_id,))
+            return cursor.fetchone()
 
 def get_episodes(anime_id):
-    conn = sqlite3.connect('anime.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT number, video_url FROM episodes WHERE anime_id = ?", (anime_id,))
-    episodes = cursor.fetchall()
-    conn.close()
-    return episodes
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT number, video_url FROM episodes WHERE anime_id = %s", (anime_id,))
+            return cursor.fetchall()
 
 def add_episode(anime_id, number, video_url):
-    conn = sqlite3.connect('anime.db')
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO episodes (anime_id, number, video_url) VALUES (?, ?, ?)",
-        (anime_id, number, video_url)
-    )
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO episodes (anime_id, number, video_url) VALUES (%s, %s, %s)",
+                (anime_id, number, video_url)
+        conn.commit()
 
 def set_admin(user_id):
-    conn = sqlite3.connect('anime.db')
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT OR REPLACE INTO users (user_id, is_admin) VALUES (?, 1)",
-        (user_id,)
-    )
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO users (user_id, is_admin) VALUES (%s, TRUE) "
+                "ON CONFLICT (user_id) DO UPDATE SET is_admin = EXCLUDED.is_admin",
+                (user_id,)
+        conn.commit()
 
 def is_admin(user_id):
-    conn = sqlite3.connect('anime.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result and result[0] == 1
+    with get_connection() as conn:
+        with conn.cursor() as cursor:
+            cursor.execute("SELECT is_admin FROM users WHERE user_id = %s", (user_id,))
+            result = cursor.fetchone()
+            return result and result[0]
 
 # ===================== Обработчики команд =====================
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
