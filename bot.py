@@ -1,9 +1,10 @@
 import os
 import sys
 import logging
+import re
 from dotenv import load_dotenv
 import psycopg2
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -200,7 +201,8 @@ async def anime_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_photo(
             chat_id=query.message.chat_id,
             photo=cover_url,
-            caption=f"Обложка: {title}",
+            caption=f"🎬 <b>{title}</b>",
+            parse_mode="HTML",
             reply_to_message_id=query.message.message_id
         )
 
@@ -219,17 +221,42 @@ async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("Серия не найдена")
         return
     
-    # Отправляем видео или ссылку
-    if video_url.startswith("http"):
-        await context.bot.send_message(
+    anime = get_anime_details(anime_id)
+    anime_title = anime[1] if anime else "Неизвестное аниме"
+    
+    # Проверяем, является ли ссылка из ВКонтакте
+    is_vk_video = "vk.com" in video_url or "vk.com/video" in video_url
+    
+    if is_vk_video:
+        # Отправляем ссылку с кнопкой для открытия в VK
+        keyboard = [
+            [InlineKeyboardButton("▶️ Смотреть в ВК", url=video_url)],
+            [InlineKeyboardButton("🔙 Назад", callback_data=f"anime_{anime_id}")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await context.bot.send_photo(
             chat_id=query.message.chat_id,
-            text=f"🎬 Серия {episode_number}:\n{video_url}"
+            photo=anime[3] if anime and anime[3] else None,
+            caption=f"🎬 <b>{anime_title}</b>\n🔹 Серия {episode_number}\n\nСсылка на видео: {video_url}",
+            parse_mode="HTML",
+            reply_markup=reply_markup
+        )
+    elif video_url.startswith("http"):
+        # Обычная ссылка (YouTube, Google Drive и т.д.)
+        await context.bot.send_photo(
+            chat_id=query.message.chat_id,
+            photo=anime[3] if anime and anime[3] else None,
+            caption=f"🎬 <b>{anime_title}</b>\n🔹 Серия {episode_number}\n\nСсылка: {video_url}",
+            parse_mode="HTML"
         )
     else:
+        # Локальное видео или файл Telegram
         await context.bot.send_video(
             chat_id=query.message.chat_id,
             video=video_url,
-            caption=f"Серия {episode_number}",
+            caption=f"🎬 <b>{anime_title}</b>\n🔹 Серия {episode_number}",
+            parse_mode="HTML",
             supports_streaming=True
         )
 
@@ -237,26 +264,19 @@ async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     
-    # Получаем список аниме
     anime_list = get_anime_list()
     
     if not anime_list:
         await query.edit_message_text("Аниме пока нет в базе данных.")
         return
     
-    # Создаем клавиатуру с аниме
     keyboard = [
         [InlineKeyboardButton(title, callback_data=f"anime_{id}")]
         for id, title in anime_list
     ]
     
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    # Редактируем текущее сообщение
-    await query.edit_message_text(
-        "Выберите аниме:",
-        reply_markup=reply_markup
-    )
+    await query.edit_message_text("Выберите аниме:", reply_markup=reply_markup)
 
 # ===================== Админ-панель =====================
 async def admin_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -298,7 +318,6 @@ async def show_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если команда вызвана из callback, редактируем сообщение
     if update.callback_query:
         await update.callback_query.edit_message_text(
             "Админ-панель:",
@@ -377,10 +396,10 @@ async def select_anime_for_episode(update: Update, context: ContextTypes.DEFAULT
     
     await query.edit_message_text(
         "Отправьте номер серии и видео одним из способов:\n"
-        "1. Ссылку на видео (любой источник)\n"
+        "1. Ссылку на видео (ВК, YouTube и т.д.)\n"
         "2. Видеофайл с подписью\n\n"
         "Пример для ссылки:\n"
-        "1 | https://example.com/episode1.mp4\n\n"
+        "1 | https://vk.com/video-123456_789\n\n"
         "Пример для видеофайла:\n"
         "1 (в подписи к видео)",
         parse_mode="HTML"
@@ -401,7 +420,7 @@ async def receive_episode_data(update: Update, context: ContextTypes.DEFAULT_TYP
                 
             episode_number = int(update.message.caption)
             video_file = await update.message.video.get_file()
-            video_url = video_file.file_path  # Прямая ссылка на видео в Telegram
+            video_url = video_file.file_path
         else:
             # Если прислали текст с ссылкой
             data = update.message.text.split('|')
@@ -412,10 +431,8 @@ async def receive_episode_data(update: Update, context: ContextTypes.DEFAULT_TYP
             episode_number = int(data[0].strip())
             video_url = data[1].strip()
         
-        # Сохраняем в базу
         add_episode(anime_id, episode_number, video_url)
         await update.message.reply_text(f"✅ Серия {episode_number} добавлена!")
-        
         del context.user_data['selected_anime_id']
         
     except ValueError:
@@ -459,7 +476,6 @@ async def admin_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===================== Главная функция =====================
 def main():
-    # Инициализация базы данных с обработкой ошибок
     try:
         init_db()
         logger.info("Database initialized successfully")
@@ -467,7 +483,6 @@ def main():
         logger.error(f"Database initialization failed: {e}")
         sys.exit(1)
     
-    # Создание приложения
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Обработчики команд
@@ -494,7 +509,6 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_episode_data))
     application.add_handler(MessageHandler(filters.VIDEO, receive_episode_data))
     
-    # Запуск бота
     logger.info("Starting bot...")
     application.run_polling()
 
