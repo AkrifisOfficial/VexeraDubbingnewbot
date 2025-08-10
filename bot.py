@@ -549,4 +549,5 @@ def main():
     logger.info("Starting bot...")
     application.run_polling()
 
-if __name__ == '__main'
+if __name__ == '__main__':
+    main()
