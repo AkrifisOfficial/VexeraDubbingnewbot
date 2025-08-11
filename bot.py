@@ -536,4 +536,20 @@ def main():
     
     # Админ-панель
     application.add_handler(CallbackQueryHandler(admin_command, pattern="^admin_panel$"))
-    application.add_handler(CallbackQueryHandler(add_anime_handler, pattern="^admin_add_anime$"
+    application.add_handler(CallbackQueryHandler(add_anime_handler, pattern="^admin_add_anime$"))
+    application.add_handler(CallbackQueryHandler(add_episode_handler, pattern="^admin_add_episode$"))
+    application.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
+    application.add_handler(CallbackQueryHandler(select_anime_for_episode, pattern="^admin_episode_"))
+    application.add_handler(CallbackQueryHandler(admin_cancel, pattern="^admin_cancel$"))
+    
+    # Обработчики сообщений
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_anime_data))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, receive_episode_data))
+    application.add_handler(MessageHandler(filters.VIDEO, receive_episode_data))
+    
+    # Запуск бота
+    logger.info("✅ Бот запущен и ожидает сообщений...")
+    application.run_polling()
+
+if __name__ == '__main__':
+    main()
