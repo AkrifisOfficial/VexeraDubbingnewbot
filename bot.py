@@ -219,8 +219,9 @@ async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if is_vk_video:
         keyboard = [
-            [InlineKeyboardButton("▶️ Смотреть в ВК", url=video_url)])
-       ]
+            [InlineKeyboardButton("▶️ Смотреть в ВК", url=video_url)]
+            # Убрана кнопка "Назад"
+        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await context.bot.send_photo(
@@ -231,10 +232,9 @@ async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=reply_markup
         )
     elif video_url.startswith("http"):
-        await context.bot.send_photo(
+        await context.bot.send_message(
             chat_id=query.message.chat_id,
-            photo=anime[3] if anime and anime[3] else None,
-            caption=f"🎬 <b>{anime_title}</b>\n🔹 Серия {episode_number}\n\nСсылка: {video_url}",
+            text=f"🎬 <b>{anime_title}</b>\n🔹 Серия {episode_number}\n\nСсылка: {video_url}",
             parse_mode="HTML"
         )
     else:
