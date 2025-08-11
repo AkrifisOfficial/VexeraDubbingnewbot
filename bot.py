@@ -179,21 +179,19 @@ async def anime_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
     episodes = get_episodes(anime_id)
     
     # Создаем кнопки для серий
+    keyboard = []
     if episodes:
-        # Группируем серии по 3 в ряд
-        episodes_buttons = []
-        row = []
-        for i, (number, _) in enumerate(episodes):
-            row.append(InlineKeyboardButton(f"🎬 {number}", callback_data=f"episode_{anime_id}_{number}"))
-            if (i + 1) % 3 == 0 or i == len(episodes) - 1:
-                episodes_buttons.append(row)
-                row = []
-        keyboard = episodes_buttons
-    else:
-        keyboard = []
+        # Добавляем кнопки для серий
+        for number, video_url in episodes:
+            # Создаем кнопку с номером серии
+            button = InlineKeyboardButton(
+                f"▶️ Серия {number}", 
+                callback_data=f"episode_{anime_id}_{number}"
+            )
+            keyboard.append([button])
     
     # Кнопка "Назад" в главное меню
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back_to_menu")])
+    keyboard.append([InlineKeyboardButton("🔙 Назад к списку аниме", callback_data="back_to_menu")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -231,19 +229,31 @@ async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # Создаем кнопку для просмотра
-    keyboard = [
-        [InlineKeyboardButton("▶️ Смотреть онлайн", url=video_url)],
-
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
+    watch_button = InlineKeyboardButton(
+        "▶️ Смотреть серию", 
+        url=video_url if video_url.startswith("http") else f"https://t.me/{context.bot.username}?start=video_{episode_number}"
+    )
     
-    # Отправляем сообщение с кнопкой
+    # Для Telegram видео создаем специальную кнопку
+    if not video_url.startswith("http"):
+        # Отправляем видео напрямую
+        await context.bot.send_video(
+            chat_id=query.message.chat_id,
+            video=video_url,
+            caption=f"🎬 Серия {episode_number}",
+            supports_streaming=True
+        )
+        return
+    
+    # Для внешних ссылок (VK и др.) отправляем кнопку
+    keyboard = InlineKeyboardMarkup([[watch_button]])
+    
     await context.bot.send_message(
         chat_id=query.message.chat_id,
         text=f"🎥 <b>Серия {episode_number}</b>\n\n"
              "В меню: /menu",
         parse_mode="HTML",
-        reply_markup=reply_markup
+        reply_markup=keyboard
     )
 
 async def back_to_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
