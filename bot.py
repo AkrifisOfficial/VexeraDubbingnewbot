@@ -220,7 +220,8 @@ async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_vk_video:
         keyboard = [
             [InlineKeyboardButton("▶️ Смотреть в ВК", url=video_url)],
-            [InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")]  # Возврат в главное меню
+            keyboard.append([InlineKeyboardButton("В меню", callback_data="back_to_menu")])
+            reply_markup = InlineKeyboardMarkup(keyboard)
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
