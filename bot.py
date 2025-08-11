@@ -219,15 +219,14 @@ async def watch_episode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if is_vk_video:
         keyboard = [
-            [InlineKeyboardButton("▶️ Смотреть в ВК", url=video_url)],
-            [InlineKeyboardButton("🔙 В меню", callback_data="back_to_menu")])
+            [InlineKeyboardButton("▶️ Смотреть в ВК", url=video_url)])
        ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
         await context.bot.send_photo(
             chat_id=query.message.chat_id,
             photo=anime[3] if anime and anime[3] else None,
-            caption=f"🎬 <b>{anime_title}</b>\n🔹 Серия {episode_number}\n\nЧтобы посмотреть серию нажмите кнопку ниже:",
+            caption=f"🎬 <b>{anime_title}</b>\n🔹 Серия {episode_number}\n\nВ меню: /menu",
             parse_mode="HTML",
             reply_markup=reply_markup
         )
